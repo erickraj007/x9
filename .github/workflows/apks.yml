@@ -1,0 +1,310 @@
+name: Build X9 APKs
+
+# Builds the X9 user, merchant and super admin Android apps.
+#   - every push that touches apps/  -> debug APKs you can install straight away
+#   - a tag like v1.0.0              -> release APKs (signed when the signing secrets are set) + a GitHub Release
+#   - "Run workflow" button          -> build on demand: choose the server URL, debug/release and which app
+#
+# Download: Actions -> the run -> Artifacts (x9-user-apk-run<N>, x9-merchant-apk-run<N>, x9-superadmin-apk-run<N>).
+# Step by step guide for non-developers: docs/APK-BUILD.md. Problems: docs/TROUBLESHOOTING-APPS.md.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths-ignore: ['docs/**', 'deploy/**', '**/*.md']
+  pull_request:
+    paths: ['apps/**', '.github/workflows/apks.yml']
+  workflow_dispatch:
+    inputs:
+      api_base:
+        description: 'Backend API base URL, e.g. https://api.yourdomain.com/api/v1 (empty = repository variable X9_API_BASE, then the default)'
+        required: false
+        default: ''
+      build_type:
+        description: 'release (default, fast, recommended) or debug (slow, red error screens)'
+        required: false
+        default: 'release'
+        type: choice
+        options: [release, debug]
+      app:
+        description: 'Which app to build'
+        required: false
+        default: 'all'
+        type: choice
+        options: [all, user, merchant, freelance, superadmin]
+
+permissions:
+  contents: write
+
+env:
+  # Default server. Override per run with the "Run workflow" input, or set repository
+  # variable X9_API_BASE (Settings -> Secrets and variables -> Actions -> Variables).
+  DEFAULT_API_BASE: 'http://187.127.157.39/api/v1'
+  FLUTTER_VERSION: '3.35.5'
+
+jobs:
+  plan:
+    name: Plan (which apps)
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          WANT: ${{ github.event.inputs.app }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          want = (os.environ.get("WANT") or "all").strip().lower() or "all"
+          apps = [
+            {"app": "user", "dir": "apps/user", "package": "in.donezo.x9.user", "label": "X9", "artifact": "x9-user-apk"},
+            {"app": "merchant", "dir": "apps/merchant", "package": "in.donezo.x9.merchant", "label": "X9 Merchant", "artifact": "x9-merchant-apk"},
+            {"app": "freelance", "dir": "apps/freelance", "package": "in.donezo.x9.freelance", "label": "X9 Sales", "artifact": "x9-freelance-apk"},
+            {"app": "superadmin", "dir": "apps/superadmin", "package": "in.donezo.x9.superadmin", "label": "X9 Super Admin", "artifact": "x9-superadmin-apk"},
+          ]
+          if want != "all":
+            apps = [a for a in apps if a["app"] == want]
+          if not apps:
+            raise SystemExit("Unknown app '%s' (use all, user, merchant, freelance or superadmin)" % want)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+            fh.write("matrix=" + json.dumps({"include": apps}) + "\n")
+          print("Building:", ", ".join(a["app"] for a in apps))
+          PY
+
+  build:
+    name: ${{ matrix.app }} app
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- 1. Is the source code really here? (the most common mistake is uploading the .zip file itself) ----
+      - name: Check the source code is present
+        env:
+          APP_DIR: ${{ matrix.dir }}
+        run: |
+          fail() { echo "::error title=Source code missing::$1"; exit 1; }
+          MSG="source code missing: you must push the whole repository (folders apps/, .github/) to GitHub, not the zip file"
+          [ -d "$APP_DIR" ] || fail "$MSG ($APP_DIR/ not found)"
+          [ -f "$APP_DIR/pubspec.yaml" ] || fail "$MSG ($APP_DIR/pubspec.yaml not found)"
+          [ -f "$APP_DIR/lib/main.dart" ] || fail "$MSG ($APP_DIR/lib/main.dart not found)"
+          [ -d apps/x9_core ] || fail "$MSG (apps/x9_core/ not found: the shared package is required)"
+          [ -f apps/x9_core/pubspec.yaml ] || fail "$MSG (apps/x9_core/pubspec.yaml not found)"
+          echo "Dart files in $APP_DIR/lib:"
+          (cd "$APP_DIR" && find lib -name '*.dart' | wc -l)
+          echo "Dart files in apps/x9_core/lib:"
+          (cd apps/x9_core && find lib -name '*.dart' | wc -l)
+          N=$(cd "$APP_DIR" && find lib -name '*.dart' | wc -l)
+          [ "$N" -ge 1 ] || fail "$MSG (no .dart files in $APP_DIR/lib)"
+          echo "App version: $(grep -m1 '^version:' "$APP_DIR/pubspec.yaml")"
+
+      # ---- 2. Which server will the app talk to? Decide now and fail early if it is nonsense ----
+      - name: Resolve API address and certificate mode
+        env:
+          INPUT_API_BASE: ${{ github.event.inputs.api_base }}
+          VAR_API_BASE: ${{ vars.X9_API_BASE }}
+          DEFAULT_API_BASE: ${{ env.DEFAULT_API_BASE }}
+        run: |
+          trim() { printf '%s' "$1" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+          API_BASE="$(trim "${INPUT_API_BASE:-}")"
+          SOURCE="the 'api_base' input of this run"
+          if [ -z "$API_BASE" ]; then API_BASE="$(trim "${VAR_API_BASE:-}")"; SOURCE="repository variable X9_API_BASE"; fi
+          if [ -z "$API_BASE" ]; then API_BASE="$(trim "${DEFAULT_API_BASE:-}")"; SOURCE="DEFAULT_API_BASE in apks.yml"; fi
+          if [ -z "$API_BASE" ]; then
+            echo "::error title=API address empty::The API address is empty. Set the repository variable X9_API_BASE (Settings > Secrets and variables > Actions > Variables), e.g. https://api.yourdomain.com/api/v1"
+            exit 1
+          fi
+          case "$API_BASE" in
+            https://*|http://*) ;;
+            *) echo "::error title=API address invalid::API_BASE '$API_BASE' (from $SOURCE) must start with https:// or http://  - example: https://api.yourdomain.com/api/v1"; exit 1 ;;
+          esac
+          HOST="${API_BASE#*://}"; HOST="${HOST%%/*}"; HOST="${HOST##*@}"
+          case "$HOST" in \[*) HOSTONLY="$HOST" ;; *) HOSTONLY="${HOST%%:*}" ;; esac
+          if [ -z "$HOSTONLY" ]; then
+            echo "::error title=API address invalid::API_BASE '$API_BASE' has no host name."; exit 1
+          fi
+          if printf '%s' "$HOSTONLY" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then SELF=true; else SELF=false; fi
+          case "$API_BASE" in
+            */api/v1|*/api/v1/) ;;
+            *) echo "::warning title=API address looks unusual::API_BASE '$API_BASE' does not end with /api/v1 - the apps normally need it (https://api.yourdomain.com/api/v1)." ;;
+          esac
+          echo "API_BASE=$API_BASE"
+          echo "ALLOW_SELF_SIGNED=$SELF  (host '$HOSTONLY' is $([ "$SELF" = true ] && echo 'an IPv4 address: self-signed certificate accepted' || echo 'a domain name: a valid certificate is required'))"
+          echo "Source of the address: $SOURCE"
+          {
+            echo "API_BASE=$API_BASE"
+            echo "ALLOW_SELF_SIGNED=$SELF"
+            if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then echo "BUILD_MODE=debug"; else echo "BUILD_MODE=release"; fi
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Show versions
+        run: flutter --version
+
+      # flutter create fills in the Gradle/Android scaffolding that is deliberately not committed.
+      # Our own files (lib/, pubspec.yaml, android/app/src/main/AndroidManifest.xml, MainActivity.kt,
+      # res/mipmap-*) are kept: flutter create never overwrites an existing file.
+      - name: Generate Android scaffolding
+        working-directory: ${{ matrix.dir }}
+        run: |
+          flutter create --project-name x9_${{ matrix.app }} --org com.donezo.x9 --platforms=android .
+          rm -rf test
+          test -f lib/main.dart || { echo "::error::lib/main.dart disappeared after flutter create"; exit 1; }
+          grep -q runX9App lib/main.dart || { echo "::error::lib/main.dart is not the X9 app (Flutter demo template)"; exit 1; }
+
+      - name: Configure Gradle (applicationId, minSdk, desugaring, signing)
+        working-directory: ${{ matrix.dir }}/android
+        run: |
+          python3 "$GITHUB_WORKSPACE/.github/scripts/patch_gradle.py" \
+            --dir . --application-id "${{ matrix.package }}" --label "${{ matrix.label }}"
+          echo '--- app/build.gradle.kts (or .gradle) after patching ---'
+          cat app/build.gradle.kts 2>/dev/null || cat app/build.gradle
+          echo '--- INTERNET permission in the manifest ---'
+          grep -n 'android.permission.INTERNET' app/src/main/AndroidManifest.xml || { echo "::error::AndroidManifest.xml has no INTERNET permission: the app could never reach the server"; exit 1; }
+
+      - name: Add Firebase config (if provided)
+        working-directory: ${{ matrix.dir }}
+        env:
+          GS_USER: ${{ secrets.GOOGLE_SERVICES_JSON_USER }}
+          GS_MERCHANT: ${{ secrets.GOOGLE_SERVICES_JSON_MERCHANT }}
+          GS_SUPERADMIN: ${{ secrets.GOOGLE_SERVICES_JSON_SUPERADMIN }}
+          GS_FREELANCE: ${{ secrets.GOOGLE_SERVICES_JSON_FREELANCE }}
+        run: |
+          case "${{ matrix.app }}" in
+            user) CONTENT="$GS_USER" ;;
+            merchant) CONTENT="$GS_MERCHANT" ;;
+            freelance) CONTENT="$GS_FREELANCE" ;;
+            superadmin) CONTENT="$GS_SUPERADMIN" ;;
+            *) CONTENT="" ;;
+          esac
+          if [ -n "$CONTENT" ]; then
+            printf '%s' "$CONTENT" > android/app/google-services.json
+            python3 "$GITHUB_WORKSPACE/.github/scripts/patch_gradle.py" --dir android --enable-google-services
+            echo "google-services.json installed - push notifications and Google sign-in are enabled."
+          else
+            echo "No google-services.json secret for the ${{ matrix.app }} app: building without Firebase (the app still runs; push is off)."
+          fi
+
+      - name: Set up release signing (if provided)
+        if: ${{ github.event.inputs.build_type != 'debug' }}
+        working-directory: ${{ matrix.dir }}/android
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > app/x9-release.jks
+            cat > key.properties <<EOF
+          storeFile=x9-release.jks
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+            echo "Release keystore installed."
+          else
+            echo "No ANDROID_KEYSTORE_BASE64 secret: the release APK will be signed with the debug key (fine for testing, not for the Play Store)."
+          fi
+
+      - name: Resolve packages
+        working-directory: ${{ matrix.dir }}
+        run: flutter pub get
+
+      - name: Analyze (warnings only, never fails the build)
+        working-directory: ${{ matrix.dir }}
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings || true
+
+      - name: Build APK
+        working-directory: ${{ matrix.dir }}
+        env:
+          GOOGLE_SERVER_CLIENT_ID: ${{ secrets.GOOGLE_SERVER_CLIENT_ID }}
+          SUPPORT_EMAIL: ${{ vars.X9_SUPPORT_EMAIL }}
+          SUPPORT_PHONE: ${{ vars.X9_SUPPORT_PHONE }}
+        run: |
+          echo "Building $BUILD_MODE against $API_BASE (ALLOW_SELF_SIGNED=$ALLOW_SELF_SIGNED)"
+          OBF=""; if [ "$BUILD_MODE" = "release" ]; then OBF="--obfuscate --split-debug-info=$RUNNER_TEMP/symbols"; fi
+          flutter build apk --$BUILD_MODE --no-shrink $OBF \
+            --dart-define=API_BASE="$API_BASE" \
+            --dart-define=ALLOW_SELF_SIGNED="$ALLOW_SELF_SIGNED" \
+            --dart-define=GOOGLE_SERVER_CLIENT_ID="$GOOGLE_SERVER_CLIENT_ID" \
+            --dart-define=SUPPORT_EMAIL="$SUPPORT_EMAIL" \
+            --dart-define=SUPPORT_PHONE="$SUPPORT_PHONE"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp build/app/outputs/flutter-apk/app-$BUILD_MODE.apk "$GITHUB_WORKSPACE/out/x9-${{ matrix.app }}-$BUILD_MODE.apk"
+          ls -lh "$GITHUB_WORKSPACE/out"
+
+      # ---- 3. Is the APK a real Flutter app? (a blank-screen APK is usually missing code or assets) ----
+      - name: Validate the APK
+        env:
+          APP: ${{ matrix.app }}
+        run: |
+          APK="out/x9-$APP-$BUILD_MODE.apk"
+          fail() { echo "::error title=APK check failed ($APP)::$1"; exit 1; }
+          [ -f "$APK" ] || fail "$APK was not produced"
+          SIZE=$(stat -c %s "$APK")
+          MB=$(( SIZE / 1024 / 1024 ))
+          echo "Size: $SIZE bytes (~${MB} MB)"
+          [ "$SIZE" -gt 8388608 ] || fail "APK is only ${MB} MB (expected more than 8 MB): the Flutter engine or the app code is not inside. See docs/TROUBLESHOOTING-APPS.md"
+          LIST="$(unzip -l "$APK")"
+          printf '%s\n' "$LIST" | grep -Eq ' classes\.dex$' || fail "classes.dex missing inside the APK"
+          printf '%s\n' "$LIST" | grep -Eq ' lib/[^/]+/libflutter\.so$' || fail "lib/*/libflutter.so missing inside the APK (Flutter engine)"
+          printf '%s\n' "$LIST" | grep -Eq ' assets/flutter_assets/AssetManifest\.(bin|json)$' || fail "assets/flutter_assets/AssetManifest.bin(.json) missing inside the APK"
+          printf '%s\n' "$LIST" | grep -Eq ' lib/[^/]+/libapp\.so$|assets/flutter_assets/kernel_blob\.bin$' || echo "::warning::neither libapp.so (release) nor kernel_blob.bin (debug) found"
+          SHA=$(sha256sum "$APK" | cut -d' ' -f1)
+          ( cd out && sha256sum "$(basename "$APK")" > "$(basename "$APK").sha256" )
+          echo "sha256: $SHA"
+          echo "APK checks passed."
+          {
+            echo "### X9 $APP app - $BUILD_MODE"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| File | \`$(basename "$APK")\` |"
+            echo "| Size | $SIZE bytes (~${MB} MB) |"
+            echo "| SHA-256 | \`$SHA\` |"
+            echo "| API address built in | \`$API_BASE\` |"
+            echo "| Self-signed certificate allowed | $ALLOW_SELF_SIGNED |"
+            echo "| Version | \`$(grep -m1 '^version:' ${{ matrix.dir }}/pubspec.yaml | sed 's/version: *//')\` |"
+            echo "| Dart files in app/lib | $(cd ${{ matrix.dir }} && find lib -name '*.dart' | wc -l) |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-run${{ github.run_number }}
+          path: |
+            out/*.apk
+            out/*.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    name: Attach APKs to the release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - run: ls -R dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.apk
+          generate_release_notes: true

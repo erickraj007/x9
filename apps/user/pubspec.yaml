@@ -1,0 +1,37 @@
+name: x9_user
+description: X9 user app
+publish_to: none
+version: 1.5.0+8
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  x9_core:
+    path: ../x9_core
+  url_launcher: ^6.3.1
+  app_links: ^6.4.0
+  geolocator: 13.0.2
+  image_picker: 1.1.2
+  geocoding: 3.0.0
+  video_player: ^2.9.2
+  google_sign_in: ^6.2.2
+  firebase_core: ^3.13.0
+  firebase_messaging: ^15.2.5
+  flutter_local_notifications: 18.0.1
+  qr_flutter: ^4.1.0
+  gal: ^2.3.1
+  share_plus: ^10.1.4
+  http: ^1.2.2
+  path_provider: ^2.1.5
+  intl: ">=0.19.0 <0.21.0"
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true

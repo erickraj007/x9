@@ -1,0 +1,325 @@
+name: Build X9 iOS app
+
+# v6.19: builds the X9 user app for iPhone on a GitHub macOS runner (an iPhone app can only be compiled on a Mac).
+#   - every push that touches apps/user or apps/x9_core -> iOS app (unsigned .ipa, or signed .ipa when the Apple secrets are set)
+#                                                          + an iOS Simulator build for testing on a Mac
+#   - a tag like v1.0.0                                 -> the same, and upload to TestFlight when the App Store Connect key is set
+#   - "Run workflow" button                             -> choose the server URL and whether to upload to TestFlight
+#
+# Download: Actions -> "Build X9 iOS app" -> the run -> Artifacts (x9-user-ios-run<N>).
+# Step-by-step guide (Apple account, certificates, secrets, TestFlight): docs/IOS-BUILD.md
+#
+# Secrets (Settings -> Secrets and variables -> Actions). All optional; without them you get an unsigned build.
+#   IOS_DIST_CERT_P12_BASE64       Apple Distribution (or Development) certificate exported as .p12, base64
+#   IOS_DIST_CERT_PASSWORD         password of that .p12
+#   IOS_PROVISION_PROFILE_BASE64   provisioning profile (.mobileprovision) for the bundle id, base64
+#   GOOGLE_SERVICE_INFO_PLIST_USER GoogleService-Info.plist of the iOS app in Firebase (push + Google sign-in)
+#   GOOGLE_SERVER_CLIENT_ID        same Web client ID as the Android build
+#   APP_STORE_CONNECT_KEY_ID / APP_STORE_CONNECT_ISSUER_ID / APP_STORE_CONNECT_KEY_P8_BASE64   TestFlight upload
+# Variables: X9_API_BASE (server), X9_IOS_BUNDLE_ID (default in.donezo.x9.user), X9_SUPPORT_EMAIL, X9_SUPPORT_PHONE
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths:
+      - 'apps/user/**'
+      - 'apps/x9_core/**'
+      - '.github/workflows/ios.yml'
+      - '.github/scripts/patch_ios.py'
+      - '.github/scripts/ios_add_resource.rb'
+  workflow_dispatch:
+    inputs:
+      api_base:
+        description: 'Backend API base URL, e.g. https://api.yourdomain.com/api/v1 (empty = repository variable X9_API_BASE, then the default)'
+        required: false
+        default: ''
+      testflight:
+        description: 'Upload the signed build to TestFlight (needs the Apple signing + App Store Connect secrets)'
+        required: false
+        default: false
+        type: boolean
+      simulator:
+        description: 'Also build an iOS Simulator app (for testing on a Mac)'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEFAULT_API_BASE: 'http://187.127.157.39/api/v1'
+  FLUTTER_VERSION: '3.35.5'
+  APP_DIR: apps/user
+  APP_NAME: X9
+  MIN_IOS: '15.5'
+
+jobs:
+  ios:
+    name: X9 user app (iOS)
+    runs-on: macos-15
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the source code is present
+        run: |
+          fail() { echo "::error title=Source code missing::$1"; exit 1; }
+          MSG="source code missing: push the whole repository (apps/, .github/) to GitHub, not the zip file"
+          [ -f "$APP_DIR/pubspec.yaml" ] || fail "$MSG ($APP_DIR/pubspec.yaml not found)"
+          [ -f "$APP_DIR/lib/main.dart" ] || fail "$MSG ($APP_DIR/lib/main.dart not found)"
+          [ -f apps/x9_core/pubspec.yaml ] || fail "$MSG (apps/x9_core/pubspec.yaml not found)"
+          [ -f "$APP_DIR/ios/Runner/AppDelegate.swift" ] || fail "$MSG ($APP_DIR/ios/Runner/AppDelegate.swift not found - the v6.19 iOS files are missing)"
+          [ -f "$APP_DIR/ios/Podfile" ] || fail "$MSG ($APP_DIR/ios/Podfile not found)"
+          [ -f "$APP_DIR/lib/services/upi_apps_ios.dart" ] || fail "$MSG ($APP_DIR/lib/services/upi_apps_ios.dart not found)"
+          echo "App version: $(grep -m1 '^version:' "$APP_DIR/pubspec.yaml")"
+
+      - name: Resolve API address, bundle id and build number
+        env:
+          INPUT_API_BASE: ${{ github.event.inputs.api_base }}
+          VAR_API_BASE: ${{ vars.X9_API_BASE }}
+          VAR_BUNDLE_ID: ${{ vars.X9_IOS_BUNDLE_ID }}
+        run: |
+          trim() { printf '%s' "$1" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+          API_BASE="$(trim "${INPUT_API_BASE:-}")"
+          [ -n "$API_BASE" ] || API_BASE="$(trim "${VAR_API_BASE:-}")"
+          [ -n "$API_BASE" ] || API_BASE="$DEFAULT_API_BASE"
+          case "$API_BASE" in https://*|http://*) ;; *) echo "::error title=API address invalid::API_BASE '$API_BASE' must start with https:// or http://"; exit 1 ;; esac
+          HOST="${API_BASE#*://}"; HOST="${HOST%%/*}"; HOST="${HOST%%:*}"
+          if printf '%s' "$HOST" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then SELF=true; else SELF=false; fi
+          BUNDLE_ID="$(trim "${VAR_BUNDLE_ID:-}")"; [ -n "$BUNDLE_ID" ] || BUNDLE_ID=in.donezo.x9.user
+          BUILD_NAME="$(grep -m1 '^version:' "$APP_DIR/pubspec.yaml" | sed -e 's/version: *//' -e 's/+.*//')"
+          BUILD_NUMBER=$(( 100 + ${{ github.run_number }} ))
+          echo "API_BASE=$API_BASE  ALLOW_SELF_SIGNED=$SELF  BUNDLE_ID=$BUNDLE_ID  VERSION=$BUILD_NAME ($BUILD_NUMBER)"
+          {
+            echo "API_BASE=$API_BASE"
+            echo "ALLOW_SELF_SIGNED=$SELF"
+            echo "BUNDLE_ID=$BUNDLE_ID"
+            echo "BUILD_NAME=$BUILD_NAME"
+            echo "BUILD_NUMBER=$BUILD_NUMBER"
+          } >> "$GITHUB_ENV"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Show versions
+        run: |
+          flutter --version
+          xcodebuild -version
+          pod --version
+
+      # flutter create fills in the Xcode project around the committed files (lib/, pubspec.yaml,
+      # ios/Runner/AppDelegate.swift, ios/Podfile, the X9 app icon): it never overwrites an existing file.
+      - name: Generate the iOS project
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          flutter create --project-name x9_user --org com.donezo.x9 --platforms=ios .
+          rm -rf test
+          grep -q runX9App lib/main.dart || { echo "::error::lib/main.dart is not the X9 app (Flutter demo template)"; exit 1; }
+          grep -q 'X9 user app' ios/Runner/AppDelegate.swift || { echo "::error::ios/Runner/AppDelegate.swift was replaced"; exit 1; }
+          test -f ios/Runner.xcodeproj/project.pbxproj
+
+      - name: Add Firebase config (if provided)
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          GS_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_USER }}
+        run: |
+          if [ -z "$GS_PLIST" ]; then
+            echo "No GOOGLE_SERVICE_INFO_PLIST_USER secret: building without Firebase (the app runs; push and Google sign-in are off)."
+            exit 0
+          fi
+          case "$GS_PLIST" in
+            *'<plist'*) printf '%s' "$GS_PLIST" > ios/Runner/GoogleService-Info.plist ;;
+            *) printf '%s' "$GS_PLIST" | base64 --decode > ios/Runner/GoogleService-Info.plist ;;
+          esac
+          plutil -lint ios/Runner/GoogleService-Info.plist
+          PLIST_BUNDLE=$(/usr/libexec/PlistBuddy -c 'Print :BUNDLE_ID' ios/Runner/GoogleService-Info.plist 2>/dev/null || true)
+          if [ -n "$PLIST_BUNDLE" ] && [ "$PLIST_BUNDLE" != "$BUNDLE_ID" ]; then
+            echo "::warning title=Firebase bundle id::GoogleService-Info.plist is for '$PLIST_BUNDLE' but the app is '$BUNDLE_ID'. Add an iOS app with bundle id $BUNDLE_ID in Firebase and use its plist."
+          fi
+          ruby "$GITHUB_WORKSPACE/.github/scripts/ios_add_resource.rb" ios/Runner.xcodeproj GoogleService-Info.plist
+          echo "HAS_GOOGLE_PLIST=true" >> "$GITHUB_ENV"
+
+      - name: Set up Apple signing (if provided)
+        env:
+          P12_B64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          P12_PASS: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          PROFILE_B64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+        run: |
+          if [ -z "$P12_B64" ] || [ -z "$PROFILE_B64" ]; then
+            echo "No IOS_DIST_CERT_P12_BASE64 / IOS_PROVISION_PROFILE_BASE64 secrets: building an UNSIGNED app (see docs/IOS-BUILD.md)."
+            echo "SIGN=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/x9-signing.keychain-db"
+          KC_PASS="$(openssl rand -hex 16)"
+          security create-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
+          printf '%s' "$P12_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PASS" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KC_PASS" "$KEYCHAIN" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          echo "Identities in the keychain:"; security find-identity -v -p codesigning "$KEYCHAIN"
+
+          printf '%s' "$PROFILE_B64" | base64 --decode > "$RUNNER_TEMP/x9.mobileprovision"
+          security cms -D -i "$RUNNER_TEMP/x9.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          PB() { /usr/libexec/PlistBuddy -c "Print :$1" "$RUNNER_TEMP/profile.plist" 2>/dev/null; }
+          PROFILE_NAME="$(PB Name)"; PROFILE_UUID="$(PB UUID)"; TEAM_ID="$(PB TeamIdentifier:0)"
+          APP_ID="$(PB Entitlements:application-identifier)"; PROFILE_BUNDLE="${APP_ID#*.}"
+          if [ "$PROFILE_BUNDLE" != "*" ] && [ "$PROFILE_BUNDLE" != "$BUNDLE_ID" ]; then
+            echo "::error title=Provisioning profile::The profile '$PROFILE_NAME' is for '$PROFILE_BUNDLE' but the app bundle id is '$BUNDLE_ID'. Set repository variable X9_IOS_BUNDLE_ID=$PROFILE_BUNDLE or make a profile for $BUNDLE_ID."
+            exit 1
+          fi
+          if [ "$(PB Entitlements:get-task-allow)" = "true" ]; then METHOD=development; IDENTITY="Apple Development"
+          elif PB ProvisionedDevices >/dev/null; then METHOD=ad-hoc; IDENTITY="Apple Distribution"
+          elif [ "$(PB ProvisionsAllDevices)" = "true" ]; then METHOD=enterprise; IDENTITY="Apple Distribution"
+          else METHOD=app-store-connect; IDENTITY="Apple Distribution"; fi
+          if PB Entitlements:aps-environment >/dev/null; then PUSH=true; else PUSH=false; fi
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/x9.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          echo "Profile: $PROFILE_NAME ($METHOD) team $TEAM_ID, push=$PUSH"
+          {
+            echo "SIGN=true"
+            echo "KEYCHAIN=$KEYCHAIN"
+            echo "PROFILE_NAME=$PROFILE_NAME"
+            echo "TEAM_ID=$TEAM_ID"
+            echo "EXPORT_METHOD=$METHOD"
+            echo "SIGN_IDENTITY=$IDENTITY"
+            echo "PUSH=$PUSH"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure the iOS project (bundle id, permissions, UPI apps, push, signing)
+        env:
+          GOOGLE_SERVER_CLIENT_ID: ${{ secrets.GOOGLE_SERVER_CLIENT_ID }}
+        run: |
+          ARGS=(--dir "$APP_DIR/ios" --bundle-id "$BUNDLE_ID" --name "$APP_NAME" --min-ios "$MIN_IOS" --server-client-id "${GOOGLE_SERVER_CLIENT_ID:-}")
+          [ "${HAS_GOOGLE_PLIST:-}" = true ] && ARGS+=(--google-plist "$APP_DIR/ios/Runner/GoogleService-Info.plist")
+          if [ "$SIGN" = true ]; then
+            ARGS+=(--team-id "$TEAM_ID" --profile-name "$PROFILE_NAME" --sign-identity "$SIGN_IDENTITY")
+            [ "$PUSH" = true ] && ARGS+=(--push)
+          fi
+          python3 .github/scripts/patch_ios.py "${ARGS[@]}"
+          plutil -lint "$APP_DIR/ios/Runner/Info.plist"
+
+      - name: Resolve packages and CocoaPods
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          flutter pub get
+          cd ios && pod install --repo-update
+
+      - name: Analyze (warnings only, never fails the build)
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings || true
+
+      - name: Build the iPhone app
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          GOOGLE_SERVER_CLIENT_ID: ${{ secrets.GOOGLE_SERVER_CLIENT_ID }}
+          SUPPORT_EMAIL: ${{ vars.X9_SUPPORT_EMAIL }}
+          SUPPORT_PHONE: ${{ vars.X9_SUPPORT_PHONE }}
+        run: |
+          DEFINES=(--dart-define=API_BASE="$API_BASE" --dart-define=ALLOW_SELF_SIGNED="$ALLOW_SELF_SIGNED"
+                   --dart-define=GOOGLE_SERVER_CLIENT_ID="${GOOGLE_SERVER_CLIENT_ID:-}"
+                   --dart-define=SUPPORT_EMAIL="${SUPPORT_EMAIL:-}" --dart-define=SUPPORT_PHONE="${SUPPORT_PHONE:-}")
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          if [ "$SIGN" = true ]; then
+            cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>$EXPORT_METHOD</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>$SIGN_IDENTITY</string>
+            <key>provisioningProfiles</key><dict><key>$BUNDLE_ID</key><string>$PROFILE_NAME</string></dict>
+            <key>uploadSymbols</key><true/>
+          </dict></plist>
+          EOF
+            flutter build ipa --release --build-name="$BUILD_NAME" --build-number="$BUILD_NUMBER" \
+              --export-options-plist="$RUNNER_TEMP/ExportOptions.plist" --obfuscate --split-debug-info="$RUNNER_TEMP/symbols" "${DEFINES[@]}"
+            cp build/ios/ipa/*.ipa "$GITHUB_WORKSPACE/out/x9-user-ios-$EXPORT_METHOD.ipa"
+          else
+            flutter build ios --release --no-codesign --build-name="$BUILD_NAME" --build-number="$BUILD_NUMBER" "${DEFINES[@]}"
+            rm -rf "$RUNNER_TEMP/Payload" && mkdir -p "$RUNNER_TEMP/Payload"
+            cp -R build/ios/iphoneos/Runner.app "$RUNNER_TEMP/Payload/"
+            (cd "$RUNNER_TEMP" && zip -qry "$GITHUB_WORKSPACE/out/x9-user-ios-unsigned.ipa" Payload)
+          fi
+          ls -lh "$GITHUB_WORKSPACE/out"
+
+      - name: Validate the iPhone app
+        run: |
+          IPA=$(ls out/*.ipa | head -1)
+          fail() { echo "::error title=iOS app check failed::$1"; exit 1; }
+          [ -f "$IPA" ] || fail "no .ipa was produced"
+          SIZE=$(stat -f %z "$IPA"); MB=$(( SIZE / 1024 / 1024 ))
+          [ "$SIZE" -gt 10485760 ] || fail "$IPA is only ${MB} MB: the Flutter engine or the app code is not inside"
+          LIST="$(unzip -l "$IPA")"
+          printf '%s\n' "$LIST" | grep -q 'Payload/Runner.app/Frameworks/Flutter.framework/' || fail "Flutter.framework missing"
+          printf '%s\n' "$LIST" | grep -q 'Payload/Runner.app/Frameworks/App.framework/App' || fail "App.framework (the X9 code) missing"
+          printf '%s\n' "$LIST" | grep -q 'flutter_assets/' || fail "flutter_assets missing"
+          ( cd out && shasum -a 256 *.ipa > SHA256SUMS.txt )
+          {
+            echo "### X9 user app - iOS"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| File | \`$(basename "$IPA")\` (~${MB} MB) |"
+            echo "| Signed | $SIGN ${EXPORT_METHOD:+($EXPORT_METHOD, push: $PUSH)} |"
+            echo "| Bundle id | \`$BUNDLE_ID\` |"
+            echo "| Version | $BUILD_NAME ($BUILD_NUMBER) |"
+            echo "| API address built in | \`$API_BASE\` |"
+            echo "| Firebase (push, Google sign-in) | ${HAS_GOOGLE_PLIST:-false} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the iOS Simulator app (for a Mac)
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.simulator == 'true' }}
+        continue-on-error: true
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          flutter build ios --simulator --debug --dart-define=API_BASE="$API_BASE" --dart-define=ALLOW_SELF_SIGNED="$ALLOW_SELF_SIGNED"
+          (cd build/ios/iphonesimulator && zip -qry "$GITHUB_WORKSPACE/out/x9-user-ios-simulator.app.zip" Runner.app)
+
+      - name: Upload the iOS app
+        uses: actions/upload-artifact@v4
+        with:
+          name: x9-user-ios-run${{ github.run_number }}
+          path: |
+            out/*.ipa
+            out/*.zip
+            out/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload to TestFlight
+        if: ${{ env.SIGN == 'true' && (github.ref_type == 'tag' || github.event.inputs.testflight == 'true') }}
+        env:
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          KEY_P8_B64: ${{ secrets.APP_STORE_CONNECT_KEY_P8_BASE64 }}
+        run: |
+          if [ -z "$KEY_ID" ] || [ -z "$ISSUER_ID" ] || [ -z "$KEY_P8_B64" ]; then
+            echo "::warning title=TestFlight::App Store Connect API key secrets are not set: skipped the TestFlight upload (see docs/IOS-BUILD.md)."
+            exit 0
+          fi
+          if [ "$EXPORT_METHOD" != "app-store-connect" ]; then
+            echo "::warning title=TestFlight::The provisioning profile is '$EXPORT_METHOD', TestFlight needs an App Store profile. Skipped."
+            exit 0
+          fi
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          printf '%s' "$KEY_P8_B64" | base64 --decode > "$HOME/.appstoreconnect/private_keys/AuthKey_$KEY_ID.p8"
+          xcrun altool --upload-app --type ios -f out/x9-user-ios-app-store-connect.ipa --apiKey "$KEY_ID" --apiIssuer "$ISSUER_ID"
+          echo "Uploaded to TestFlight. It appears in App Store Connect -> TestFlight after Apple's processing (10-30 min)."
+
+      - name: Remove the signing keychain
+        if: ${{ always() && env.KEYCHAIN != '' }}
+        run: security delete-keychain "$KEYCHAIN" || true
